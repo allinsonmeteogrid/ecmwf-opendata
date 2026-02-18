@@ -144,7 +144,13 @@ class Client:
     def url(self):
         return self.source.url
 
-    def _download(self, result: Result, disable_progress_bar=False) -> Result:
+    def _download(
+        self,
+        result: Result,
+        disable_progress_bar=False,
+        maximum_retries=None,
+        retry_after=None,
+    ) -> Result:
         if self.use_sas_token:
             result.urls = self._apply_sas_to_urls(result.urls)
 
@@ -156,8 +162,8 @@ class Client:
             session=self.session,
             accept_ranges=self.source.accept_ranges,
             accept_multiple_ranges=self.source.accept_multiple_ranges,
-            maximum_retries=self.maximum_retries,
-            retry_after=self.retry_after,
+            maximum_retries=self.maximum_retries if maximum_retries is None else maximum_retries,
+            retry_after=self.retry_after if retry_after is None else retry_after,
         )
         _show_attribution_message()
         return result
@@ -170,13 +176,29 @@ class Client:
             use_server_retry_after=self.use_server_retry_after,
         )
 
-    def retrieve(self, request=None, target=None, disable_progress_bar=False, **kwargs):
+    def retrieve(
+        self,
+        request=None,
+        target=None,
+        disable_progress_bar=False,
+        maximum_retries=None,
+        retry_after=None,
+        **kwargs
+    ):
         result = self._get_urls(request, target=target, use_index=True, **kwargs)
-        return self._download(result, disable_progress_bar)
+        return self._download(result, disable_progress_bar, maximum_retries, retry_after)
 
-    def download(self, request=None, target=None, disable_progress_bar=False, **kwargs):
+    def download(
+        self,
+        request=None,
+        target=None,
+        disable_progress_bar=False,
+        maximum_retries=None,
+        retry_after=None,
+        **kwargs
+    ):
         result = self._get_urls(request, target=target, use_index=False, **kwargs)
-        return self._download(result, disable_progress_bar)
+        return self._download(result, disable_progress_bar, maximum_retries, retry_after)
 
     def latest(self, request=None, **kwargs):
         if request is None:
