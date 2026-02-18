@@ -189,7 +189,7 @@ class Client:
 
         return self._url
 
-    def retrieve(self, request=None, target=None, **kwargs):
+    def retrieve(self, request=None, target=None, disable_progress_bar=False, **kwargs):
         result = self._get_urls(request, target=target, use_index=True, **kwargs)
 
         if self.use_sas_token:
@@ -198,13 +198,14 @@ class Client:
         result.size = download(
             result.urls,
             target=result.target,
+            disable_progress_bar=disable_progress_bar,
             verify=self.verify,
             session=self.session,
         )
         _show_attribution_message()
         return result
 
-    def download(self, request=None, target=None, **kwargs):
+    def download(self, request=None, target=None, disable_progress_bar=False, **kwargs):
         result = self._get_urls(request, target=target, use_index=False, **kwargs)
 
         if self.use_sas_token:
@@ -213,6 +214,7 @@ class Client:
         result.size = download(
             result.urls,
             target=result.target,
+            disable_progress_bar=disable_progress_bar,
             verify=self.verify,
             session=self.session,
         )
