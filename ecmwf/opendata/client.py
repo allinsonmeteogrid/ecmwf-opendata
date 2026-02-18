@@ -189,7 +189,15 @@ class Client:
 
         return self._url
 
-    def retrieve(self, request=None, target=None, disable_progress_bar=False, **kwargs):
+    def retrieve(
+        self,
+        request=None,
+        target=None,
+        disable_progress_bar=False,
+        maximum_retries=500,
+        retry_after=120,
+        **kwargs
+    ):
         result = self._get_urls(request, target=target, use_index=True, **kwargs)
 
         if self.use_sas_token:
@@ -201,11 +209,21 @@ class Client:
             disable_progress_bar=disable_progress_bar,
             verify=self.verify,
             session=self.session,
+            maximum_retries=maximum_retries,
+            retry_after=retry_after,
         )
         _show_attribution_message()
         return result
 
-    def download(self, request=None, target=None, disable_progress_bar=False, **kwargs):
+    def download(
+        self,
+        request=None,
+        target=None,
+        disable_progress_bar=False,
+        maximum_retries=500,
+        retry_after=120,
+        **kwargs
+    ):
         result = self._get_urls(request, target=target, use_index=False, **kwargs)
 
         if self.use_sas_token:
@@ -217,6 +235,8 @@ class Client:
             disable_progress_bar=disable_progress_bar,
             verify=self.verify,
             session=self.session,
+            maximum_retries=maximum_retries,
+            retry_after=retry_after,
         )
         _show_attribution_message()
         return result
