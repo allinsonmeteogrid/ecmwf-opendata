@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from collections import defaultdict
+from typing import Optional
 
 import requests
 from multiurl import download, robust
@@ -26,79 +27,35 @@ from .date import (
     expand_time,
     full_date,
 )
-from .urls import URLS
+from .sources import source_factory
+from .utils import _show_attribution_message, warning_once
 
 LOG = logging.getLogger(__name__)
 
 HOURLY_PATTERN = (
     "{_url}/{_yyyymmdd}/{_H}z/{model}/{resol}/{_stream}/"
-    "{_yyyymmddHHMMSS}-{step}h-{_stream}-{type}.{_extension}"
+    "{_yyyymmddHHMMSS}-{step}h-{_stream}-{type}{_levfile}.{_extension}"
 )
 
 MONTHLY_PATTERN = (
     "{_url}/{_yyyymmdd}/{_H}z/{model}/{resol}/{_stream}/"
-    "{_yyyymmddHHMMSS}-{fcmonth}m-{_stream}-{type}.{_extension}"
+    "{_yyyymmddHHMMSS}-{fcmonth}m-{_stream}-{type}{_levfile}.{_extension}"
 )
 
 PATTERNS = {"mmsa": MONTHLY_PATTERN}
 EXTENSIONS = {"tf": "bufr"}
 
-ONCE = set()
-
-_ATTRIBUTION_SHOWN = False  # module-level guard to avoid spamming
-
-
-def _show_attribution_message():
-    global _ATTRIBUTION_SHOWN
-    if not _ATTRIBUTION_SHOWN:
-        print(
-            "By downloading data from the ECMWF open data dataset, you agree to "
-            "the terms: Attribution 4.0 International (CC BY 4.0). Please "
-            "attribute ECMWF when downloading this data."
-        )
-        _ATTRIBUTION_SHOWN = True
-
-
-def warning_once(*args, did_you_mean=None):
-    if repr(args) in ONCE:
-        return
-
-    LOG.warning(*args)
-
-    ONCE.add(repr(args))
-
-    if did_you_mean:
-        (words, vocabulary) = did_you_mean
-
-        def levenshtein(a, b):
-            if len(a) == 0:
-                return len(b)
-
-            if len(b) == 0:
-                return len(a)
-
-            if a[0].lower() == b[0].lower():
-                return levenshtein(a[1:], b[1:])
-
-            return 1 + min(
-                [
-                    levenshtein(a[1:], b[1:]),
-                    levenshtein(a[1:], b),
-                    levenshtein(a, b[1:]),
-                ]
-            )
-
-        if not isinstance(words, (list, tuple)):
-            words = [words]
-
-        for word in words:
-            distance, best = min((levenshtein(word, w), w) for w in vocabulary)
-            if distance < min(len(word), len(best)):
-                LOG.warning(
-                    "Did you mean %r instead of %r?",
-                    best,
-                    word,
-                )
+# Resolutions whose GRIB files are split by level type into
+# "<name>-sfc.grib2" and "<name>-pl.grib2" instead of a single file
+SPLIT_RESOLUTIONS = {"0p1"}
+# Resolutions only produced by the IFS model
+IFS_ONLY_RESOLUTIONS = {"0p1"}
+# Soil level fields (levtype=sol) are disseminated with the single level fields
+LEVTYPE_FILES = {"sfc": "-sfc", "sol": "-sfc", "pl": "-pl"}
+# Wave streams only have single level fields, so there is no "-pl" file
+SFC_ONLY_STREAMS = {"wave", "waef", "scwv"}
+# Tropical cyclone tracks (BUFR) are only produced at the default resolution
+TF_RESOL = "0p25"
 
 
 class Result:
@@ -111,6 +68,7 @@ class Result:
             self.datetime = dates
         self.for_urls = for_urls
         self.for_index = for_index
+        self.size = None
 
 
 class Client:
@@ -127,9 +85,17 @@ class Client:
         use_sas_token=None,
         sas_known_key="ecmwf",
         sas_custom_url=None,
+        source_accept_ranges=None,
+        source_accept_multiple_ranges=None,
+        maximum_retries=500,
+        retry_after=120,
+        use_server_retry_after=True,
     ):
-        self._url = None
-        self.source = source
+        self.source = source_factory(
+            name=source,
+            accept_ranges=source_accept_ranges,
+            accept_multiple_ranges=source_accept_multiple_ranges,
+        )
         self.model = model
         self.resol = resol
         self.beta = beta
@@ -137,6 +103,9 @@ class Client:
         self.infer_stream_keyword = infer_stream_keyword
         self.session = requests.Session()
         self.verify = verify
+        self.maximum_retries = maximum_retries
+        self.retry_after = retry_after
+        self.use_server_retry_after = use_server_retry_after
 
         if source == "ecmwf":
             warning_once(
@@ -173,73 +142,63 @@ class Client:
 
     @property
     def url(self):
-        if self._url is None:
-            if self.source.startswith("http://") or self.source.startswith("https://"):
-                self._url = self.source
-            else:
-                if self.source not in URLS:
-                    warning_once(
-                        "Unknown source %r. Known sources are %r",
-                        self.source,
-                        list(URLS.keys()),
-                        did_you_mean=(self.source, list(URLS.keys())),
-                    )
-                    raise ValueError("Unknown source %r" % (self.source,))
-                self._url = URLS[self.source]
+        return self.source.url
 
-        return self._url
+    def _download(
+        self,
+        result: Result,
+        disable_progress_bar=False,
+        maximum_retries=None,
+        retry_after=None,
+    ) -> Result:
+        if self.use_sas_token:
+            result.urls = self._apply_sas_to_urls(result.urls)
+
+        result.size = download(
+            result.urls,
+            target=result.target,
+            disable_progress_bar=disable_progress_bar,
+            verify=self.verify,
+            session=self.session,
+            accept_ranges=self.source.accept_ranges,
+            accept_multiple_ranges=self.source.accept_multiple_ranges,
+            maximum_retries=self.maximum_retries if maximum_retries is None else maximum_retries,
+            retry_after=self.retry_after if retry_after is None else retry_after,
+        )
+        _show_attribution_message()
+        return result
+
+    def _robust(self, call):
+        return robust(
+            call,
+            self.maximum_retries,
+            self.retry_after,
+            use_server_retry_after=self.use_server_retry_after,
+        )
 
     def retrieve(
         self,
         request=None,
         target=None,
         disable_progress_bar=False,
-        maximum_retries=500,
-        retry_after=120,
+        maximum_retries=None,
+        retry_after=None,
         **kwargs
     ):
         result = self._get_urls(request, target=target, use_index=True, **kwargs)
-
-        if self.use_sas_token:
-            result.urls = self._apply_sas_to_urls(result.urls)
-
-        result.size = download(
-            result.urls,
-            target=result.target,
-            disable_progress_bar=disable_progress_bar,
-            verify=self.verify,
-            session=self.session,
-            maximum_retries=maximum_retries,
-            retry_after=retry_after,
-        )
-        _show_attribution_message()
-        return result
+        return self._download(result, disable_progress_bar, maximum_retries, retry_after)
 
     def download(
         self,
         request=None,
         target=None,
         disable_progress_bar=False,
-        maximum_retries=500,
-        retry_after=120,
+        maximum_retries=None,
+        retry_after=None,
         **kwargs
     ):
         result = self._get_urls(request, target=target, use_index=False, **kwargs)
-
-        if self.use_sas_token:
-            result.urls = self._apply_sas_to_urls(result.urls)
-
-        result.size = download(
-            result.urls,
-            target=result.target,
-            disable_progress_bar=disable_progress_bar,
-            verify=self.verify,
-            session=self.session,
-            maximum_retries=maximum_retries,
-            retry_after=retry_after,
-        )
-        _show_attribution_message()
-        return result
+        return self._download(result, disable_progress_bar, maximum_retries, retry_after)
 
     def latest(self, request=None, **kwargs):
         if request is None:
@@ -264,7 +223,7 @@ class Client:
                 **params,
             )
             codes = [
-                robust(self.session.head)(url, verify=self.verify).status_code
+                self._robust(self.session.head)(url, verify=self.verify).status_code
                 for url in result.urls
             ]
             if len(codes) > 0 and all(c == 200 for c in codes):
@@ -273,7 +232,13 @@ class Client:
 
         raise ValueError("Cannot establish latest date for %r" % (result.for_urls,))
 
-    def _get_urls(self, request=None, use_index=None, target=None, **kwargs):
+    def _get_urls(
+        self,
+        request: Optional[dict] = None,
+        use_index: bool = False,
+        target: Optional[str] = None,
+        **kwargs,
+    ) -> Result:
         assert use_index in (True, False)
         if request is None:
             params = dict(**kwargs)
@@ -288,7 +253,7 @@ class Client:
 
         for_urls, for_index = self.prepare_request(params)
 
-        for_urls["_url"] = [self.url]
+        for_urls["_url"] = [self.source.url]
 
         seen = set()
         data_urls = []
@@ -307,19 +272,35 @@ class Client:
             args["_extension"] = EXTENSIONS.get(args["type"], "grib2")
             args["_stream"] = self.patch_stream(args)
 
+            if args["type"] == "tf":
+                args["resol"] = TF_RESOL
+
+            resol = args["resol"]
+
             if self.beta:
                 # test data is put in an /experimental subdir after resol
                 # it is not part of a mars request, so we inject it here
                 args["resol"] += "/experimental"
 
-            url = pattern.format(**args)
+            for levfile in self.level_files(resol, args, for_index):
+                url = pattern.format(_levfile=levfile, **args)
 
-            if self.resol == "0p4-beta":
-                url = url.replace("/ifs/", "/")
+                if resol == "0p4-beta":
+                    url = url.replace("/ifs/", "/")
 
-            if url not in seen:
-                data_urls.append(url)
-                seen.add(url)
+                if url not in seen:
+                    data_urls.append(url)
+                    seen.add(url)
+
+        IFS_50R1_DATE = datetime.datetime(2026, 5, 12)
+        if any(d < IFS_50R1_DATE for d in dates):
+            warning_once(
+                "Some requested dates are before 2026-05-12. Data before this date uses a "
+                "different stream structure (06/18 UTC runs are under stream=scda/scwv) "
+                "compared to data on or after 2026-05-12 (where those runs are under "
+                "stream=oper/wave). This is handled automatically, but be aware that "
+                "the underlying file structure differs across this boundary."
+            )
 
         if for_index and use_index:
             data_urls = self.get_parts(data_urls, for_index)
@@ -332,6 +313,22 @@ class Client:
             for_index=for_index,
         )
 
+    def level_files(self, resol, args, for_index):
+        # Files at a split resolution are separated into single level ("-sfc")
+        # and pressure level ("-pl") files. If no levtype is requested, both are
+        # returned so that the result matches what the single file would contain.
+        if resol not in SPLIT_RESOLUTIONS or args["type"] == "tf":
+            return [""]
+
+        if args["_stream"] in SFC_ONLY_STREAMS:
+            return [LEVTYPE_FILES["sfc"]]
+
+        levtypes = [x for x in for_index.get("levtype", []) if x in LEVTYPE_FILES]
+        if not levtypes:
+            levtypes = ["sfc", "pl"]
+
+        return list(dict.fromkeys(LEVTYPE_FILES[x] for x in levtypes))
+
     def get_parts(self, data_urls, for_index):
         count = len(for_index)
         result = []
@@ -342,7 +339,7 @@ class Client:
         for url in data_urls:
             base, _ = os.path.splitext(url)
             index_url = f"{base}.index"
-            r = robust(self.session.get)(index_url, verify=self.verify)
+            r = self._robust(self.session.get)(index_url, verify=self.verify)
             r.raise_for_status()
 
             parts = []
@@ -418,9 +415,10 @@ class Client:
         else:
             params = dict(**request)
 
-        # If model is in the retireve overwrite the client model
-        # Warn user if client model does not match the model in retrieve
         if "model" in params:
+            # If model is in the retireve overwrite the client model
+            # Warn user if client model does not match the model in retrieve
+            # Takes precedence over class-based model derivation
             if self.model != params["model"]:
                 warning_once(
                     "Model %r does not match the client model %r, using model %r from retrieve",
@@ -430,17 +428,44 @@ class Client:
                     did_you_mean=(params["model"], self.model),
                 )
             model = params["model"]
-        else:
-            model = self.model
-
-        if "class" in params:
+        elif "class" in params:
+            # If model is implied by class, overwrite the client model
+            # Warn user if client model does not match the model from class
             model = {"od": "ifs", "ai": "aifs-single", "aifs-ens": "aifs-ens"}[
                 params["class"]
             ]
+            if self.model != model:
+                warning_once(
+                    "Model %r derived from class %r does not match the client model %r, using model %r",
+                    model,
+                    params["class"],
+                    self.model,
+                    model,
+                    did_you_mean=(model, self.model),
+                )
+        else:
+            model = self.model
+
+        if "resol" in params and params["resol"] != self.resol:
+            warning_once(
+                "Resolution %r does not match the client resolution %r, using resolution %r from retrieve",
+                params["resol"],
+                self.resol,
+                params["resol"],
+            )
+
+        resol = params.get("resol", self.resol)
+        if not isinstance(resol, (list, tuple)):
+            resol = str(resol).split("/")
+        if model != "ifs" and any(r in IFS_ONLY_RESOLUTIONS for r in resol):
+            raise ValueError(
+                "Resolution %r is only available for model 'ifs', not %r"
+                % ("/".join(resol), model)
+            )
 
         # Default stream for aifs-ens is enfo as this model only has ensemble forecasts
         if model == "aifs-ens":
-            params["stream"] = "enfo"
+            params.setdefault("stream", "enfo")
 
         DEFAULTS_FC = dict(
             model=model,
@@ -514,6 +539,7 @@ class Client:
         POSSIBLE_VALUES = {
             "type": ["tf", "fc", "fcmean", "cf", "pf", "em", "ep", "es"],
             "stream": ["oper", "wave", "scda", "scwv", "enfo", "waef", "mmsa"],
+            "resol": ["0p25", "0p1", "0p4-beta"],
         }
 
         defaults = DEFAULTS.get(params.get("stream"), DEFAULTS_FC)
@@ -605,21 +631,40 @@ class Client:
         return (dict(**for_urls), dict(**for_index))
 
     def patch_stream(self, args):
-        URL_STREAM_MAPPING = {
-            ("oper", "06"): "scda",
-            ("oper", "18"): "scda",
-            ("wave", "06"): "scwv",
-            ("wave", "18"): "scwv",
-            #
-            ("oper", "ef"): "enfo",
-            ("wave", "ef"): "waef",
-            ("oper", "ep"): "enfo",
-            ("wave", "ep"): "waef",
-            ("scda", "ef"): "enfo",
-            ("scwv", "ef"): "waef",
-            ("scda", "ep"): "enfo",
-            ("scwv", "ep"): "waef",
-        }
+        # As of IFS Cycle 50r1 (operational from 2026-05-12), the 06/18 UTC runs are
+        # archived under stream=oper/wave rather than stream=scda/scwv.
+        # source="ecmwf-testdata" always uses the new structure.
+        # All other sources use the new structure for dates >= 2026-05-12 and the
+        # old structure for earlier dates, allowing requests that span the boundary.
+        IFS_50R1_DATE = datetime.date(2026, 5, 12)
+
+        request_date = datetime.datetime.strptime(args["_yyyymmdd"], "%Y%m%d").date()
+
+        if self.source.name == "ecmwf-testdata" or request_date >= IFS_50R1_DATE:
+            # New structure: 06/18 runs stay under oper/wave
+            URL_STREAM_MAPPING = {
+                ("oper", "ef"): "enfo",
+                ("wave", "ef"): "waef",
+                ("oper", "ep"): "enfo",
+                ("wave", "ep"): "waef",
+            }
+        else:
+            # Old structure: 06/18 runs mapped to scda/scwv
+            URL_STREAM_MAPPING = {
+                ("oper", "06"): "scda",
+                ("oper", "18"): "scda",
+                ("wave", "06"): "scwv",
+                ("wave", "18"): "scwv",
+                #
+                ("oper", "ef"): "enfo",
+                ("wave", "ef"): "waef",
+                ("oper", "ep"): "enfo",
+                ("wave", "ep"): "waef",
+                ("scda", "ef"): "enfo",
+                ("scwv", "ef"): "waef",
+                ("scda", "ep"): "enfo",
+                ("scwv", "ep"): "waef",
+            }
         stream, time, type = args["stream"], args["_H"], args["type"]
 
         if not self.infer_stream_keyword or args["model"] == "aifs-single":
